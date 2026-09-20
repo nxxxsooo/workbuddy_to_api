@@ -1,6 +1,6 @@
 # workbuddy_to_api
 
-把本机 WorkBuddy 的模型能力转换为 OpenAI 与 Anthropic 兼容 API。项目主体是一个 Python 单文件程序，使用 Python 标准库，无第三方运行依赖。
+把本机 WorkBuddy 的模型能力转换为 OpenAI 与 Anthropic 兼容 API。项目主体是一个 Python 单文件程序，使用 Python 标准库，无第三方运行依赖，支持 Windows / macOS / Linux。
 
 ## 功能
 
@@ -11,6 +11,7 @@
 - Anthropic Token Count：`/v1/messages/count_tokens`
 - 动态读取 WorkBuddy 本地模型目录
 - OpenAI / Anthropic 客户端函数调用兼容
+- 模型思考过程（reasoning）实时透传：`reasoning_content` / `thinking` / `reasoning` item
 - WorkBuddy 内置工具调用
 - MCP 配置发现、工具清单、连通测试与管理页
 - SSE 流式输出
@@ -20,10 +21,10 @@
 
 ## 运行要求
 
-- Windows 10 或 Windows 11
+- Windows 10/11、macOS 或 Linux
 - Python 3.10 或更高版本
 - 已安装并登录 WorkBuddy
-- 默认安装目录：`%LOCALAPPDATA%\Programs\WorkBuddy`
+- 默认安装目录：Windows `%LOCALAPPDATA%\Programs\WorkBuddy`；macOS `/Applications/WorkBuddy.app`
 
 模型目录读取顺序：
 
@@ -33,10 +34,21 @@
 
 ## 快速开始
 
+Windows（PowerShell）：
+
 ```powershell
 cd workbuddy_to_api
 python .\workbuddy_to_api.py --background --api-key local
 ```
+
+macOS / Linux：
+
+```bash
+cd workbuddy_to_api
+python3 workbuddy_to_api.py --api-key local
+```
+
+macOS 环境下如需自定义安装路径，参考 `.env.example` 中的 `WORKBUDDY_EXE` / `WORKBUDDY_CLI_SCRIPT` 示例。
 
 默认地址：
 
@@ -158,6 +170,32 @@ WORKBUDDY_MODEL_ALIASES={"my-default":"auto","claude-local":"glm-5.2"}
 
 代理会让 WorkBuddy 生成严格 JSON 工具选择结果，然后转换成各协议对应的 `tool_calls`、`function_call` 或 `tool_use`。
 
+## 思考过程（Reasoning）透传
+
+支持思考的模型（DeepSeek V4.1、GLM-5.3 系列等推理模型）会把思考过程实时透传为各协议的标准思考字段：
+
+| 端点 | 流式 | 非流式 |
+|---|---|---|
+| OpenAI Chat Completions | `delta.reasoning_content` | `message.reasoning_content` |
+| Anthropic Messages | `thinking` block + `thinking_delta` | `thinking` content block |
+| OpenAI Responses | `reasoning` output item | `reasoning` output item |
+
+实现基于 WorkBuddy CLI 的 ACP 会话通道（`agent_thought_chunk` 思考流），ACP 不可用时自动回退 runs 流路径。思考内容为模型原文透传，不做任何提示词注入或内容改写；模型不思考（简单问题）时自然没有对应字段。
+
+```python
+stream = client.chat.completions.create(
+    model="deepseek-v4.1-flash",
+    messages=[{"role": "user", "content": "9.11 和 9.9 哪个大？"}],
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta.reasoning_content:
+        print("[思考]", delta.reasoning_content, end="")
+    if delta.content:
+        print(delta.content, end="")
+```
+
 ## WorkBuddy 内置工具与事件流
 
 普通请求会启用 WorkBuddy 的默认工具。启动参数可控制工具配置：
@@ -254,6 +292,7 @@ Copy-Item .env.example .env
 | `WORKBUDDY_MAX_TURNS` | `8` | 最大 agent 回合数 |
 | `WORKBUDDY_MCP_CONFIG` | 自动发现 | MCP JSON 或配置文件路径 |
 | `WORKBUDDY_EVENT_MAX_BYTES` | `65536` | 单个事件字段大小上限 |
+| `WORKBUDDY_MAX_BODY_BYTES` | `104857600` | 请求体大小上限（默认 100MB） |
 | `WORKBUDDY_ACCOUNT_SESSION_PATH` | 自动发现 | WorkBuddy 本地会话文件路径，仅在内存中读取 |
 | `WORKBUDDY_ACCOUNT_TIMEOUT_MS` | `15000` | 账户、签到请求超时（毫秒） |
 | `WORKBUDDY_USAGE_LEDGER_MAX_RECORDS` | `1000` | 本机模型消耗账本最大记录数 |
@@ -284,10 +323,20 @@ Invoke-RestMethod `
 
 ### WorkBuddy 路径识别异常
 
+Windows：
+
 ```powershell
 python .\workbuddy_to_api.py `
   --workbuddy-exe "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe" `
   --cli-script "$env:LOCALAPPDATA\Programs\WorkBuddy\resources\app.asar.unpacked\cli\bin\codebuddy"
+```
+
+macOS：
+
+```bash
+python3 workbuddy_to_api.py \
+  --workbuddy-exe /Applications/WorkBuddy.app/Contents/MacOS/Electron \
+  --cli-script /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy
 ```
 
 ### 端口被占用
