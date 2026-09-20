@@ -12,11 +12,14 @@ import contextlib
 import datetime as _dt
 import hashlib
 import http.client
+import base64
+import gzip
 import json
 import math
 import os
 import queue
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -51,6 +54,11 @@ DEFAULT_ALIASES = {
     "claude-3-7-sonnet-20250219": "auto", "claude-3.7-sonnet": "auto",
     "claude-4-sonnet": "auto", "claude-sonnet-4": "auto",
     "claude-sonnet-4-0": "auto", "claude-sonnet-4-20250514": "auto",
+    "v4.1flash": "deepseek-v4.1-flash", "v4.1-flash": "deepseek-v4.1-flash",
+    "5.4flash": "glm-5.3-flash", "5.4-flash": "glm-5.3-flash", "glm-5.4-flash": "glm-5.3-flash",
+    "5.3flash": "glm-5.3-flash", "5.3-flash": "glm-5.3-flash",
+    "v4pro": "deepseek-v4-pro", "v4-pro": "deepseek-v4-pro",
+    "kimi-k3": "kimi-k3-1", "hy4": "hy4-preview",
 }
 MCP_PROTOCOL_VERSION = "2025-06-18"
 
@@ -180,42 +188,52 @@ def extract_quoted_flag(command_line: str, flag: str) -> str:
 
 
 def discover_runtime_mcp_config() -> Optional[dict[str, Any]]:
-    if os.name != "nt":
-        return None
-    script = (
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.Name -eq 'WorkBuddy.exe' -and $_.CommandLine -match '--mcp-config' } | "
-        "Select-Object -ExpandProperty CommandLine | ConvertTo-Json -Compress"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", script], capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    command_lines: list[str] = []
+    if os.name == "nt":
+        script = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -eq 'WorkBuddy.exe' -and $_.CommandLine -match '--mcp-config' } | "
+            "Select-Object -ExpandProperty CommandLine | ConvertTo-Json -Compress"
         )
-        raw = result.stdout.strip().lstrip("\ufeff")
-        if not raw:
-            return None
-        parsed = json.loads(raw)
-        command_lines = parsed if isinstance(parsed, list) else [parsed]
-        for command_line in command_lines:
-            value = extract_quoted_flag(str(command_line), "--mcp-config")
-            if not value.startswith("{"):
-                continue
-            try:
-                candidate = json.loads(value)
-                servers = candidate.get("mcpServers", {}) if isinstance(candidate, dict) else {}
-                for server in servers.values():
-                    if not isinstance(server, dict):
-                        continue
-                    url = str(server.get("url", ""))
-                    headers = server.get("headers", {})
-                    if re.match(r"^https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::|/)", url, re.I) and isinstance(headers, dict) and isinstance(headers.get("Authorization"), str):
-                        return candidate
-            except Exception:
-                pass
-    except Exception:
-        pass
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", script], capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            raw = result.stdout.strip().lstrip("\ufeff")
+            if raw:
+                parsed = json.loads(raw)
+                command_lines = parsed if isinstance(parsed, list) else [parsed]
+        except Exception:
+            pass
+    else:
+        # macOS / Linux: use ps to find WorkBuddy processes with --mcp-config
+        try:
+            result = subprocess.run(
+                ["ps", "auxww"], capture_output=True, text=True, timeout=8,
+            )
+            for line in result.stdout.splitlines():
+                if "WorkBuddy" in line and "--mcp-config" in line:
+                    command_lines.append(line)
+        except Exception:
+            pass
+    for command_line in command_lines:
+        value = extract_quoted_flag(str(command_line), "--mcp-config")
+        if not value.startswith("{"):
+            continue
+        try:
+            candidate = json.loads(value)
+            servers = candidate.get("mcpServers", {}) if isinstance(candidate, dict) else {}
+            for server in servers.values():
+                if not isinstance(server, dict):
+                    continue
+                url = str(server.get("url", ""))
+                headers = server.get("headers", {})
+                if re.match(r"^https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::|/)", url, re.I) and isinstance(headers, dict) and isinstance(headers.get("Authorization"), str):
+                    return candidate
+        except Exception:
+            pass
     return None
 
 
@@ -283,14 +301,23 @@ def load_cached_catalog(home: Path) -> Optional[dict[str, Any]]:
     if not directory.exists():
         return None
     best = None
-    for filename in directory.glob("entry_*.info"):
+    candidates = list(directory.glob("entry_*.info")) + list(directory.glob("wb_entry_*.info"))
+    for filename in candidates:
         try:
-            parsed = json.loads(filename.read_text(encoding="utf-8-sig"))
-            entries = parsed if isinstance(parsed, list) else [parsed]
+            raw = json.loads(filename.read_text(encoding="utf-8-sig"))
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(gzip.decompress(base64.b64decode(raw)).decode("utf-8"))
+                except Exception:
+                    pass
+            entries = raw if isinstance(raw, list) else [raw]
             for entry in entries:
                 data = entry.get("data") if isinstance(entry, dict) else None
                 if not isinstance(data, dict) or not isinstance(data.get("models"), list) or not data["models"]:
-                    continue
+                    if isinstance(entry, dict) and isinstance(entry.get("models"), list):
+                        data = entry
+                    else:
+                        continue
                 cli_agent = next((x for x in data.get("agents", []) if isinstance(x, dict) and x.get("name") == "cli"), None)
                 stamp = float(entry.get("ts") or filename.stat().st_mtime * 1000)
                 if best is None or stamp > best[0]:
@@ -491,21 +518,32 @@ class Config:
     start_timeout_ms: int
     system_prompt: str
     protocol_system_prompt: str
+    max_body_bytes: int = 100 * 1024 * 1024
     configured_model_ids: list[str] = field(default_factory=list)
     last_catalog_refresh_ms: float = 0
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Config":
-        local = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-        default_exe = local / "Programs" / "WorkBuddy" / "WorkBuddy.exe"
-        packed_cli = local / "Programs" / "WorkBuddy" / "resources" / "app.asar" / "cli" / "bin" / "codebuddy"
-        unpacked_cli = local / "Programs" / "WorkBuddy" / "resources" / "app.asar.unpacked" / "cli" / "bin" / "codebuddy"
-        default_cli = unpacked_cli if unpacked_cli.exists() else packed_cli
+        if sys.platform == "darwin":
+            # macOS: WorkBuddy.app bundle
+            app_bundle = Path("/Applications/WorkBuddy.app")
+            default_exe = app_bundle / "Contents" / "MacOS" / "Electron"
+            unpacked_cli = app_bundle / "Contents" / "Resources" / "app.asar.unpacked" / "cli" / "bin" / "codebuddy"
+            packed_cli = app_bundle / "Contents" / "Resources" / "app.asar" / "cli" / "bin" / "codebuddy"
+            default_cli = unpacked_cli if unpacked_cli.exists() else packed_cli
+            default_account_session = Path.home() / "Library" / "Application Support" / "CodeBuddyExtension" / "Data" / "Public" / "auth" / "workbuddy-desktop.info"
+        else:
+            # Windows
+            local = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+            default_exe = local / "Programs" / "WorkBuddy" / "WorkBuddy.exe"
+            packed_cli = local / "Programs" / "WorkBuddy" / "resources" / "app.asar" / "cli" / "bin" / "codebuddy"
+            unpacked_cli = local / "Programs" / "WorkBuddy" / "resources" / "app.asar.unpacked" / "cli" / "bin" / "codebuddy"
+            default_cli = unpacked_cli if unpacked_cli.exists() else packed_cli
+            default_account_session = local / "CodeBuddyExtension" / "Data" / "Public" / "auth" / "workbuddy-desktop.info"
         workbuddy_exe = Path(args.workbuddy_exe or os.getenv("WORKBUDDY_EXE") or default_exe).expanduser().resolve()
         cli_script = Path(args.cli_script or os.getenv("WORKBUDDY_CLI_SCRIPT") or default_cli).expanduser().resolve()
         default_product_config = cli_script.parent.parent / "product.json"
         product_config = Path(os.getenv("WORKBUDDY_PRODUCT_CONFIG") or default_product_config).expanduser().resolve()
-        default_account_session = local / "CodeBuddyExtension" / "Data" / "Public" / "auth" / "workbuddy-desktop.info"
         account_session_path = Path(os.getenv("WORKBUDDY_ACCOUNT_SESSION_PATH") or default_account_session).expanduser().resolve()
         catalog = load_model_catalog(cli_script, Path.home())
         configured = split_csv(os.getenv("WORKBUDDY_MODELS"), [])
@@ -544,8 +582,9 @@ class Config:
             max_turns=args.max_turns or env_int("WORKBUDDY_MAX_TURNS", 8),
             request_timeout_ms=env_int("WORKBUDDY_REQUEST_TIMEOUT_MS", 300000),
             start_timeout_ms=env_int("WORKBUDDY_START_TIMEOUT_MS", 45000),
-            system_prompt=os.getenv("WORKBUDDY_SYSTEM_PROMPT") or "You are serving an API chat request. Answer the user directly. Use WorkBuddy built-in tools and configured MCP tools when they help complete the request.",
+            system_prompt=os.getenv("WORKBUDDY_SYSTEM_PROMPT") or "You are serving an API chat request. Answer the user directly.",
             protocol_system_prompt="You are a deterministic API tool-selection adapter. Follow the client-side tool protocol in the prompt, emit the requested JSON envelope, and do not invoke internal tools.",
+            max_body_bytes=env_int("WORKBUDDY_MAX_BODY_BYTES", 100 * 1024 * 1024),
             configured_model_ids=configured,
         )
 
@@ -1145,11 +1184,24 @@ class GatewayManager:
 
     def _start(self, record: GatewayRecord) -> GatewayRecord:
         port = get_free_port(); model_slug = slug(f"{record.model}-{record.profile}")
+        # CLI session IDs only allow [A-Za-z0-9_-:]; dots in model names (e.g. v4.1) break ACP session creation.
+        session_slug = model_slug.replace(".", "").replace(":", "-")
         out_path = RUNTIME_DIR / f"gateway-{model_slug}.out.log"; err_path = RUNTIME_DIR / f"gateway-{model_slug}.err.log"
         out = open(out_path, "ab", buffering=0); err = open(err_path, "ab", buffering=0)
         out.write(f"\n=== {now_iso()} starting model={record.model} profile={record.profile} ===\n".encode()); err.write(f"\n=== {now_iso()} starting model={record.model} profile={record.profile} ===\n".encode())
         protocol = record.profile == "protocol"
-        args = [str(self.config.workbuddy_exe), str(self.config.cli_script), "--serve", "--port", str(port), "--host", "127.0.0.1", "--session-id", f"wb-api-{model_slug}-{uuid.uuid4().hex[:8]}", "--model", record.model, "--max-turns", str(1 if protocol else self.config.max_turns), "--system-prompt", self.config.protocol_system_prompt if protocol else self.config.system_prompt]
+        if sys.platform == "darwin":
+            # macOS: CLI script has #!/usr/bin/env node shebang; find node executable.
+            node_exe = shutil.which("node")
+            if not node_exe:
+                for candidate in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]:
+                    if os.path.exists(candidate):
+                        node_exe = candidate
+                        break
+            node_exe = node_exe or "node"
+            args = [node_exe, str(self.config.cli_script), "--serve", "--port", str(port), "--host", "127.0.0.1", "--session-id", f"wb-api-{session_slug}-{uuid.uuid4().hex[:8]}", "--model", record.model, "--max-turns", str(1 if protocol else self.config.max_turns), "--system-prompt", self.config.protocol_system_prompt if protocol else self.config.system_prompt]
+        else:
+            args = [str(self.config.workbuddy_exe), str(self.config.cli_script), "--serve", "--port", str(port), "--host", "127.0.0.1", "--session-id", f"wb-api-{session_slug}-{uuid.uuid4().hex[:8]}", "--model", record.model, "--max-turns", str(1 if protocol else self.config.max_turns), "--system-prompt", self.config.protocol_system_prompt if protocol else self.config.system_prompt]
         if protocol or self.config.disable_tools: args.append("--tools=")
         else:
             args += ["--permission-mode", self.config.permission_mode, "--tools", self.config.tools or "default"]
@@ -1158,7 +1210,13 @@ class GatewayManager:
             if self.config.add_dirs: args += ["--add-dir", *self.config.add_dirs]
             if self.config.mcp_config: args += ["--mcp-config", self.config.mcp_config]
             if self.config.strict_mcp_config: args.append("--strict-mcp-config")
-        env = os.environ.copy(); env.update({"ELECTRON_RUN_AS_NODE": "1", "NO_COLOR": "1", "CODEBUDDY_GATEWAY_AUTH": "none"})
+        env = os.environ.copy()
+        current_path = env.get("PATH", "")
+        for extra in ["/opt/homebrew/bin", "/usr/local/bin"]:
+            if extra not in current_path:
+                current_path = f"{extra}:{current_path}"
+        env["PATH"] = current_path
+        env.update({"ELECTRON_RUN_AS_NODE": "1", "NO_COLOR": "1", "CODEBUDDY_GATEWAY_AUTH": "none"})
         log("gateway", f"starting model={record.model} profile={record.profile} port={port}")
         try:
             process = subprocess.Popen(args, cwd=str(self.config.cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -1219,11 +1277,46 @@ def extract_event_text(message: Any) -> str:
     content = message.get("content")
     if isinstance(content, str): return content
     if isinstance(content, dict):
+        if isinstance(content.get("chunk"), str): return content["chunk"]
         if isinstance(content.get("markdown"), str): return content["markdown"]
         if isinstance(content.get("text"), str): return content["text"]
     for parent in (message.get("payload"), message.get("result")):
         if isinstance(parent, dict) and isinstance(parent.get("text"), str): return parent["text"]
     return ""
+
+
+def extract_session_reasoning(session_id: Optional[str]) -> Optional[str]:
+    if not session_id: return None
+    for attempt in range(3):
+        result = _read_session_reasoning(session_id)
+        if result is not None: return result
+        if attempt < 2: time.sleep(0.4)
+    return None
+
+
+def _read_session_reasoning(session_id: str) -> Optional[str]:
+    candidates = [
+        Path.home() / ".workbuddy" / "projects",
+        Path.home() / ".codebuddy" / "projects",
+    ]
+    for base in candidates:
+        if not base.exists(): continue
+        for p in base.rglob(f"{session_id}.jsonl"):
+            try:
+                reasoning_parts = []
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if '"type":"reasoning"' in line or '"type": "reasoning"' in line:
+                            obj = json.loads(line)
+                            if obj.get("type") == "reasoning":
+                                for item in obj.get("rawContent", []):
+                                    if isinstance(item, dict) and item.get("text"):
+                                        reasoning_parts.append(item["text"])
+                if reasoning_parts:
+                    return "\n\n".join(reasoning_parts)
+            except Exception:
+                pass
+    return None
 
 
 def text_from_content(value: Any) -> str:
@@ -1283,7 +1376,8 @@ def aggregate_usage(values: Iterable[dict[str, Any]]) -> Optional[dict[str, int]
 
 def run_acp_session(base_url: str, cwd: Path, prompt: str, timeout_ms: int, max_event_bytes: int,
                     on_delta: Optional[Callable[[str, Any], None]] = None,
-                    on_event: Optional[Callable[[dict[str, Any]], None]] = None) -> dict[str, Any]:
+                    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+                    on_thought: Optional[Callable[[str, Any], None]] = None) -> dict[str, Any]:
     timeout = timeout_ms / 1000
     connection_id: Optional[str] = None; session_id: Optional[str] = None; rpc_id = 0
     events: list[dict[str, Any]] = []; usage_map: dict[str, dict[str, Any]] = {}; emitted_usage: set[str] = set()
@@ -1303,6 +1397,10 @@ def run_acp_session(base_url: str, cwd: Path, prompt: str, timeout_ms: int, max_
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         update = params.get("update")
         if not isinstance(update, dict): return
+        if update.get("sessionUpdate") == "agent_thought_chunk":
+            thought = text_from_content(update.get("content"))
+            if thought and on_thought: on_thought(thought, update)
+            return
         if update.get("sessionUpdate") == "agent_message_chunk":
             delta = text_from_content(update.get("content"))
             if delta:
@@ -1358,7 +1456,7 @@ def run_acp_session(base_url: str, cwd: Path, prompt: str, timeout_ms: int, max_
         response.close(); connection_id = credentials.get("connectionId") if isinstance(credentials, dict) else None
         if not connection_id: raise ProxyError(502, "acp_protocol_error", "ACP connection response did not include connectionId.")
         rpc("initialize", {"protocolVersion": 1, "clientInfo": {"name": APP_NAME, "version": VERSION}, "clientCapabilities": {}})
-        created = rpc("session/new", {"cwd": str(cwd), "mcpServers": []})
+        created = rpc("session/new", {"workingDirectory": str(cwd), "cwd": str(cwd), "mcpServers": []})
         session_id = created.get("sessionId") if isinstance(created, dict) else None
         if not session_id: raise ProxyError(502, "acp_protocol_error", "ACP session/new response did not include sessionId.")
         result = rpc("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": str(prompt or "")} ]})
@@ -1393,15 +1491,21 @@ def create_upstream_run(gateway: GatewayRecord, prompt: str, conversation: str, 
 
 
 def consume_upstream_run(gateway: GatewayRecord, run_id: str, timeout_ms: int,
-                         on_delta: Optional[Callable[[str, Any], None]] = None) -> str:
+                         on_delta: Optional[Callable[[str, Any], None]] = None) -> tuple[str, Optional[str]]:
     url = gateway.base_url + "/api/v1/runs/" + urllib.parse.quote(run_id, safe="") + "/stream"
     response = urlopen_request(url, "GET", {"Accept": "text/event-stream", "X-CodeBuddy-Request": "1"}, timeout=timeout_ms / 1000)
     output = ""
+    session_id: Optional[str] = None
     try:
         for event, raw in iter_sse_response(response):
-            if event != "message" or raw == "[DONE]": continue
+            if event == "done" or raw == "[DONE]": break
+            if event != "message": continue
             try: message = json.loads(raw)
             except Exception: continue
+            if isinstance(message, dict):
+                agent = message.get("agent")
+                if isinstance(agent, dict) and agent.get("sessionId"):
+                    session_id = str(agent["sessionId"])
             text = extract_event_text(message)
             if not text: continue
             if text.startswith(output): delta = text[len(output):]
@@ -1412,21 +1516,27 @@ def consume_upstream_run(gateway: GatewayRecord, run_id: str, timeout_ms: int,
                 if on_delta: on_delta(delta, message)
     finally:
         response.close()
-    return output
+    return output, session_id
 
 
 def consume_generation(app: "ProxyApplication", model: str, prompt: str, conversation: str, profile: str = "agent",
                        workbuddy_events: bool = False, on_delta: Optional[Callable[[str, Any], None]] = None,
-                       on_event: Optional[Callable[[dict[str, Any]], None]] = None) -> dict[str, Any]:
-    if workbuddy_events and profile == "agent":
+                       on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+                       on_thought: Optional[Callable[[str, Any], None]] = None) -> dict[str, Any]:
+    # ACP sessions carry live reasoning (agent_thought_chunk); prefer them for every profile,
+    # falling back to the runs stream path when ACP is unavailable.
+    try:
         app.refresh_mcp(False, True)
-        gateway = app.gateways.get(model, "agent")
+        gateway = app.gateways.get(model, profile)
         return run_acp_session(gateway.base_url, app.config.cwd, prompt, app.config.request_timeout_ms,
-                               app.config.event_max_bytes, on_delta, on_event)
+                               app.config.event_max_bytes, on_delta, on_event, on_thought)
+    except ProxyError:
+        pass
     gateway = app.gateways.get(model, profile)
     run_id = create_upstream_run(gateway, prompt, conversation, app.config.request_timeout_ms)
-    text = consume_upstream_run(gateway, run_id, app.config.request_timeout_ms, on_delta)
-    return {"text": text, "events": [], "usage": None, "stopReason": "end_turn"}
+    text, session_id = consume_upstream_run(gateway, run_id, app.config.request_timeout_ms, on_delta)
+    reasoning = extract_session_reasoning(session_id)
+    return {"text": text, "events": [], "usage": None, "stopReason": "end_turn", "session_id": session_id, "reasoning": reasoning}
 
 
 def normalize_content(content: Any) -> str:
@@ -1690,15 +1800,29 @@ class ApiHandler(BaseHTTPRequestHandler):
         for key, val in (headers or {}).items(): self.send_header(key, str(val))
         self.end_headers()
 
+    def start_heartbeat(self, interval: float = 3.0) -> threading.Event:
+        stop_event = threading.Event()
+        def _runner():
+            while not stop_event.wait(interval):
+                try:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    break
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        return stop_event
+
     def write_sse(self, data: Any, event: Optional[str] = None) -> None:
         if event: self.wfile.write(f"event: {event}\n".encode("utf-8"))
         raw = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, separators=(",", ":"))
         self.wfile.write(f"data: {raw}\n\n".encode("utf-8")); self.wfile.flush()
 
-    def read_json(self, limit: int = 10 * 1024 * 1024) -> dict[str, Any]:
+    def read_json(self, limit: Optional[int] = None) -> dict[str, Any]:
+        max_limit = limit if limit is not None else getattr(self.app.config, "max_body_bytes", 100 * 1024 * 1024)
         try: size = int(self.headers.get("Content-Length", "0") or 0)
         except ValueError: size = 0
-        if size > limit: raise ProxyError(413, "request_too_large", f"Request body exceeds {limit} bytes.")
+        if size > max_limit: raise ProxyError(413, "request_too_large", f"Request body exceeds {max_limit} bytes (got {size} bytes).")
         raw = self.rfile.read(size) if size else b""
         if not raw: return {}
         try:
@@ -1816,16 +1940,30 @@ class ApiHandler(BaseHTTPRequestHandler):
         completion_id = "chatcmpl-" + uid(); created = int(time.time())
         if stream:
             self.begin_sse({"X-Usage-Estimated": "false" if event_mode else "true"})
+            stop_hb = self.start_heartbeat()
             self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
                             "system_fingerprint": "workbuddy-python-" + VERSION,
                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "logprobs": None, "finish_reason": None}]})
+            buffered: list[str] = []; reasoning_emitted = False
             def delta(value: str, _: Any) -> None:
-                if not plan["enabled"]:
-                    self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": value}, "logprobs": None, "finish_reason": None}]})
+                if not plan["enabled"]: buffered.append(value)
+            def thought(value: str, _: Any) -> None:
+                nonlocal reasoning_emitted
+                reasoning_emitted = True
+                self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": value}, "logprobs": None, "finish_reason": None}]})
             def event(value: dict[str, Any]) -> None: self.write_sse(value, value.get("type", "workbuddy.event"))
-            generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event)
+            try:
+                generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event, thought)
+            finally:
+                stop_hb.set()
+            reasoning = generation.get("reasoning")
+            if reasoning and not reasoning_emitted:
+                self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "logprobs": None, "finish_reason": None}]})
             finish = "stop"; output = truncate_at_stop(generation["text"], body.get("stop"))
+            if not plan["enabled"] and output:
+                self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": output}, "logprobs": None, "finish_reason": None}]})
             if plan["enabled"]:
                 parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
                 if parsed["type"] == "tool_calls":
@@ -1847,6 +1985,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode)
         output = truncate_at_stop(generation["text"], body.get("stop")); finish = "stop"
         message: dict[str, Any] = {"role": "assistant", "content": output, "refusal": None}
+        if generation.get("reasoning"): message["reasoning_content"] = generation["reasoning"]
         if plan["enabled"]:
             parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
             if parsed["type"] == "tool_calls":
@@ -1870,17 +2009,29 @@ class ApiHandler(BaseHTTPRequestHandler):
         event_mode = wants_workbuddy_events(self.headers, body, plan["profile"]); conv = conversation_id(self.headers, body); message_id = "msg_" + uid()
         if stream:
             self.begin_sse({"X-Usage-Estimated": "false" if event_mode else "true"})
+            stop_hb = self.start_heartbeat()
             self.write_sse({"type": "message_start", "message": {"id": message_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": estimate_tokens(base_prompt), "output_tokens": 0}}}, "message_start")
-            self.write_sse({"type": "ping"}, "ping"); block_started = False
+            self.write_sse({"type": "ping"}, "ping")
+            reasoning_emitted = False
             def delta(value: str, _: Any) -> None:
-                nonlocal block_started
-                if plan["enabled"]: return
-                if not block_started:
-                    self.write_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, "content_block_start"); block_started = True
-                self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": value}}, "content_block_delta")
+                pass  # content is emitted after generation so the thinking block can precede it
+            def thought(value: str, _: Any) -> None:
+                nonlocal reasoning_emitted
+                reasoning_emitted = True
+                self.write_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}, "content_block_start")
+                self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": value}}, "content_block_delta")
+                self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
             def event(value: dict[str, Any]) -> None: self.write_sse(value, value.get("type", "workbuddy.event"))
-            generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event)
+            try:
+                generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event, thought)
+            finally:
+                stop_hb.set()
             raw, stop_reason, stop_sequence = limit_anthropic_output(generation["text"], body.get("stop_sequences"), body.get("max_tokens"))
+            reasoning = generation.get("reasoning")
+            if reasoning and not reasoning_emitted:
+                self.write_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}, "content_block_start")
+                self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": reasoning}}, "content_block_delta")
+                self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
             if plan["enabled"]:
                 parsed = parse_client_tool_output(raw, plan["tools"], plan["choice"])
                 if parsed["type"] == "tool_calls":
@@ -1894,7 +2045,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.write_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, "content_block_start")
                     self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": raw}}, "content_block_delta")
                     self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
-            elif block_started: self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
+            elif raw:
+                self.write_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, "content_block_start")
+                self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": raw}}, "content_block_delta")
+                self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
             usage = anthropic_usage(base_prompt, raw, generation.get("usage"))
             self.app.record_usage(model, "anthropic", usage, generation.get("usage"))
             self.write_sse({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence}, "usage": {"output_tokens": usage["output_tokens"]}}, "message_delta")
@@ -1902,7 +2056,10 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode)
         output, stop_reason, stop_sequence = limit_anthropic_output(generation["text"], body.get("stop_sequences"), body.get("max_tokens"))
-        content: list[dict[str, Any]] = [{"type": "text", "text": output}]
+        content: list[dict[str, Any]] = []
+        if generation.get("reasoning"):
+            content.append({"type": "thinking", "thinking": generation["reasoning"]})
+        content.append({"type": "text", "text": output})
         if plan["enabled"]:
             parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
             if parsed["type"] == "tool_calls":
@@ -1926,36 +2083,45 @@ class ApiHandler(BaseHTTPRequestHandler):
         response_id = "resp_" + uid(); created = int(time.time())
         if stream:
             self.begin_sse({"X-Usage-Estimated": "false" if event_mode else "true"})
+            stop_hb = self.start_heartbeat()
             shell = {"id": response_id, "object": "response", "created_at": created, "status": "in_progress", "error": None,
                      "incomplete_details": None, "instructions": body.get("instructions"), "model": model, "output": [], "output_text": ""}
             self.write_sse({"type": "response.created", "response": shell}, "response.created")
             item_id = "msg_" + uid(); started = False
             def delta(value: str, _: Any) -> None:
-                nonlocal started
-                if plan["enabled"]: return
-                if not started:
-                    self.write_sse({"type": "response.output_item.added", "output_index": 0, "item": {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}}, "response.output_item.added")
-                    self.write_sse({"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, "response.content_part.added"); started = True
-                self.write_sse({"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": value}, "response.output_text.delta")
+                pass  # content is emitted after generation so the reasoning item can precede it
+            def thought(value: str, _: Any) -> None:
+                pass
             def event(value: dict[str, Any]) -> None: self.write_sse(value, value.get("type", "workbuddy.event"))
-            generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event)
+            try:
+                generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event, thought)
+            finally:
+                stop_hb.set()
             output = generation["text"]; items: list[dict[str, Any]] = []
+            reasoning = generation.get("reasoning"); reasoning_item = None
+            if reasoning:
+                reasoning_item = {"id": "rs_" + uid(), "type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning}]}
+                self.write_sse({"type": "response.output_item.added", "output_index": 0, "item": reasoning_item}, "response.output_item.added")
+                self.write_sse({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item}, "response.output_item.done")
+            msg_index = 1 if reasoning_item else 0
             if plan["enabled"]:
                 parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
                 if parsed["type"] == "tool_calls":
+                    base = msg_index
                     for index, call in enumerate(assign_call_ids(parsed["calls"], "fc")):
                         item = {"id": call["id"], "type": "function_call", "status": "completed", "call_id": call["id"], "name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))}
-                        items.append(item); self.write_sse({"type": "response.output_item.added", "output_index": index, "item": item}, "response.output_item.added"); self.write_sse({"type": "response.output_item.done", "output_index": index, "item": item}, "response.output_item.done")
+                        items.append(item); self.write_sse({"type": "response.output_item.added", "output_index": base + index, "item": item}, "response.output_item.added"); self.write_sse({"type": "response.output_item.done", "output_index": base + index, "item": item}, "response.output_item.done")
                     output = ""
                 else: output = parsed["content"]
             if output and not started:
                 item = {"id": item_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}; items = [item]
-                self.write_sse({"type": "response.output_item.added", "output_index": 0, "item": item}, "response.output_item.added")
+                self.write_sse({"type": "response.output_item.added", "output_index": msg_index, "item": item}, "response.output_item.added")
             elif started:
                 item = {"id": item_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}; items = [item]
-                self.write_sse({"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": output}, "response.output_text.done")
-                self.write_sse({"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": item["content"][0]}, "response.content_part.done")
-                self.write_sse({"type": "response.output_item.done", "output_index": 0, "item": item}, "response.output_item.done")
+                self.write_sse({"type": "response.output_text.done", "item_id": item_id, "output_index": msg_index, "content_index": 0, "text": output}, "response.output_text.done")
+                self.write_sse({"type": "response.content_part.done", "item_id": item_id, "output_index": msg_index, "content_index": 0, "part": item["content"][0]}, "response.content_part.done")
+                self.write_sse({"type": "response.output_item.done", "output_index": msg_index, "item": item}, "response.output_item.done")
+            if reasoning_item: items = [reasoning_item] + items
             usage = responses_usage(base_prompt, output, generation.get("usage"))
             completed = {**shell, "status": "completed", "output": items, "output_text": output, "usage": usage}
             if event_mode: completed.update({"workbuddy_events": generation.get("events", []), "workbuddy_usage": generation.get("usage")})
@@ -1964,13 +2130,15 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode)
         output = generation["text"]; items: list[dict[str, Any]]
+        reasoning = generation.get("reasoning")
+        reasoning_items = [{"id": "rs_" + uid(), "type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning}]}] if reasoning else []
         if plan["enabled"]:
             parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
             if parsed["type"] == "tool_calls":
                 calls = assign_call_ids(parsed["calls"], "fc"); output = ""
-                items = [{"id": call["id"], "type": "function_call", "status": "completed", "call_id": call["id"], "name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))} for call in calls]
-            else: output = parsed["content"]; items = [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
-        else: items = [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
+                items = reasoning_items + [{"id": call["id"], "type": "function_call", "status": "completed", "call_id": call["id"], "name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))} for call in calls]
+            else: output = parsed["content"]; items = reasoning_items + [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
+        else: items = reasoning_items + [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
         usage = responses_usage(base_prompt, output, generation.get("usage"))
         payload: dict[str, Any] = {"id": response_id, "object": "response", "created_at": created, "status": "completed", "error": None,
                                    "incomplete_details": None, "instructions": body.get("instructions"), "model": model, "output": items,
