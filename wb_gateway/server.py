@@ -482,4 +482,4 @@ def create_app(gateway):
         if allowed and origin and not result.prepared:
             result.headers.update({'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Credentials':'true','Access-Control-Allow-Headers':'Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta, X-WB-UI, X-WB-Region, X-WB-Account','Access-Control-Allow-Methods':'GET, POST, DELETE, OPTIONS','Vary':'Origin'})
         return result
-    app=web.Application(client_max_size=16*1024*1024,middlewares=[guard]); app.router.add_route('*','/{tail:.*}',gateway.handle); app.on_startup.append(gateway.start); app.on_cleanup.append(gateway.close); return app
+    app=web.Application(client_max_size=int(os.environ.get('WB_MAX_BODY_BYTES',str(100*1024*1024))),middlewares=[guard]); app.router.add_route('*','/{tail:.*}',gateway.handle); app.on_startup.append(gateway.start); app.on_cleanup.append(gateway.close); return app

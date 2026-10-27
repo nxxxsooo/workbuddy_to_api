@@ -53,7 +53,7 @@ class Launcher:
     def __init__(self,args,service_factory,home,window=None,autostart=True):
         self.args=args;self.home=Path(home);self.window=window or tk.Tk();self.service=service_factory(args);self.phase='starting' if autostart else 'stopped';self.closing=False;self.error='';self.after_id=None
         w=self.window;w.title('WB Gateway');w.geometry('500x336');w.minsize(500,336);w.resizable(False,False);w.configure(bg=COLORS['bg'])
-        families=set(tkfont.families(w));self.family=next((f for f in ('Microsoft YaHei UI','Microsoft YaHei','Noto Sans CJK SC','SimHei') if f in families),'TkDefaultFont');self.body_font=(self.family,10);self.small_font=(self.family,9)
+        families=set(tkfont.families(w));self.family=next((f for f in ('Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Noto Sans CJK SC','SimHei') if f in families),'TkDefaultFont');self.body_font=(self.family,10);self.small_font=(self.family,9)
         w.option_add('*Font',self.body_font);w.option_add('*selectBackground',COLORS['accent'])
         self.frame=tk.Frame(w,bg=COLORS['bg'],padx=24,pady=20);self.frame.pack(fill='both',expand=True)
         top=tk.Frame(self.frame,bg=COLORS['bg']);top.pack(fill='x')

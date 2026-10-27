@@ -39,10 +39,17 @@ def gui(args):
     from wb_gateway.launcher_ui import open_launcher
     open_launcher(args,Service,HOME)
 
+def gui_available():
+    try: import tkinter
+    except ImportError: return False
+    return os.name=='nt' or sys.platform=='darwin' or bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+
 def main():
     try: saved=json.loads((HOME/'launcher.json').read_text(encoding='utf-8-sig'))
     except (OSError,ValueError): saved={}
     parser=argparse.ArgumentParser(description='Native Python WorkBuddy gateway'); parser.add_argument('--headless',action='store_true'); parser.add_argument('--host',default=os.environ.get('WB_HOST','127.0.0.1')); parser.add_argument('--port',type=int,default=int(os.environ.get('WB_PORT',str(saved.get('port',8787))))); parser.add_argument('--data-dir',default=os.environ.get('WB_DATA_DIR',str(HOME/'data'))); args=parser.parse_args()
+    if not args.headless and not gui_available():
+        print('Tk GUI unavailable (install python-tk or set DISPLAY); running headless.',file=sys.stderr); args.headless=True
     if args.headless:
         lock=DataLock(Path(args.data_dir))
         try: web.run_app(create_app(Gateway(ROOT,args.data_dir)),host=args.host,port=args.port,access_log=None,print=None)
